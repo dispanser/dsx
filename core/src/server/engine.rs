@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
+use super::metrics::{Metrics, RequestRecord, Timings};
+
 #[derive(Debug, Clone)]
 pub struct GenParams {
     pub max_new: usize,
@@ -36,6 +38,17 @@ pub enum Finish {
     Stop,
     Length,
     Cancelled,
+}
+
+impl Finish {
+    /// The one-word name /metrics and the monitor page use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Finish::Stop => "stop",
+            Finish::Length => "length",
+            Finish::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// What an engine knows about its last `generate` call. Unset timings fall back to the worker's wall clock
@@ -97,6 +110,7 @@ struct Job {
 pub struct EngineHandle {
     tx: std_mpsc::Sender<Job>,
     pending: Arc<AtomicUsize>,
+    pub metrics: Arc<Metrics>,
 }
 
 impl EngineHandle {
@@ -106,6 +120,8 @@ impl EngineHandle {
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
         let pending = Arc::new(AtomicUsize::new(0));
         let pend = pending.clone();
+        let metrics = Arc::new(Metrics::new());
+        let m = metrics.clone();
         std::thread::Builder::new()
             .name("dsx-engine".into())
             .spawn(move || {
@@ -120,12 +136,12 @@ impl EngineHandle {
                     }
                 };
                 while let Ok(job) = rx.recv() {
-                    run_job(engine.as_mut(), job);
+                    run_job(engine.as_mut(), job, &m);
                     pend.fetch_sub(1, Ordering::SeqCst);
                 }
             })?;
         ready_rx.recv().context("engine thread died during construction")??;
-        Ok(Self { tx, pending })
+        Ok(Self { tx, pending, metrics })
     }
 
     /// Construct a batched engine on a dedicated thread and serve jobs concurrently (continuous batching).
@@ -134,6 +150,8 @@ impl EngineHandle {
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
         let pending = Arc::new(AtomicUsize::new(0));
         let pend = pending.clone();
+        let metrics = Arc::new(Metrics::new());
+        let m = metrics.clone();
         std::thread::Builder::new()
             .name("dsx-engine".into())
             .spawn(move || {
@@ -147,10 +165,10 @@ impl EngineHandle {
                         return;
                     }
                 };
-                run_batch(engine, rx, pend);
+                run_batch(engine, rx, pend, &m);
             })?;
         ready_rx.recv().context("engine thread died during construction")??;
-        Ok(Self { tx, pending })
+        Ok(Self { tx, pending, metrics })
     }
 
     /// Queue a generation; tokens and the final event arrive on the returned channel.
@@ -173,12 +191,13 @@ impl EngineHandle {
     }
 }
 
-fn run_job(engine: &mut dyn Engine, job: Job) {
+fn run_job(engine: &mut dyn Engine, job: Job, m: &Metrics) {
     let Job { id, prompt, params, tx, queued } = job;
     if tx.is_closed() {
         tracing::info!(%id, "cancelled while queued");
         return;
     }
+    m.begin(&id, prompt.len());
     let wait = queued.elapsed();
     let t0 = Instant::now();
     let mut first: Option<Instant> = None;
@@ -194,6 +213,7 @@ fn run_job(engine: &mut dyn Engine, job: Job) {
                 hit_stop = true;
                 return false;
             }
+            m.token();
             generated += 1;
             if tx.send(Event::Token(tok)).is_err() {
                 gone = true;
@@ -212,17 +232,17 @@ fn run_job(engine: &mut dyn Engine, job: Job) {
     let ttft = first.map(|f| f - t0).unwrap_or(total);
     let prefill = st.prefill.unwrap_or(ttft);
     let decode = st.decode.unwrap_or(total.saturating_sub(ttft));
-    let finish = match r {
+    let (finish, finish_s) = match r {
         Ok(f) => {
             // the worker's own stop/length/disconnect checks win over what the engine says
             let f = if hit_stop { Finish::Stop } else if hit_len { Finish::Length } else if gone { Finish::Cancelled } else { f };
             let _ = tx.send(Event::Done { finish: f });
-            format!("{f:?}")
+            (format!("{f:?}"), f.as_str())
         }
         Err(e) => {
             tracing::error!(%id, "engine error: {e:#}");
             let _ = tx.send(Event::Error(format!("{e:#}")));
-            "Error".into()
+            ("Error".into(), "error")
         }
     };
     let decode_tps = if generated > 1 { (generated - 1) as f64 / decode.as_secs_f64().max(1e-9) } else { 0.0 };
@@ -239,6 +259,14 @@ fn run_job(engine: &mut dyn Engine, job: Job) {
         finish,
         "done"
     );
+    m.end(RequestRecord::new(
+        &id,
+        prompt.len(),
+        st.cached_prompt_tokens,
+        generated,
+        Timings { queued: wait, prefill, decode, total },
+        finish_s,
+    ));
 }
 
 struct Running {
@@ -253,29 +281,37 @@ struct Running {
 }
 
 /// The batched engine thread: admit, step, route tokens, end sequences.
-fn run_batch(mut engine: Box<dyn BatchEngine>, rx: std_mpsc::Receiver<Job>, pend: Arc<AtomicUsize>) {
+fn run_batch(mut engine: Box<dyn BatchEngine>, rx: std_mpsc::Receiver<Job>, pend: Arc<AtomicUsize>, m: &Metrics) {
     let mut queue: std::collections::VecDeque<Job> = Default::default();
     let mut running: std::collections::HashMap<u64, Running> = Default::default();
     let mut next_id = 1u64;
-    let mut done = |engine: &mut dyn BatchEngine, running: &mut std::collections::HashMap<u64, Running>, id: u64, f: Option<Finish>, err: Option<String>| {
+    let done = |engine: &mut dyn BatchEngine, running: &mut std::collections::HashMap<u64, Running>, id: u64, f: Option<Finish>, err: Option<String>| {
         engine.finish(id);
         pend.fetch_sub(1, Ordering::SeqCst);
         if let Some(r) = running.remove(&id) {
             let total = r.started.elapsed();
             let ttft = r.first.map(|t| t - r.started).unwrap_or(total);
-            let fin = match (&f, &err) {
+            let (fin, finish_s) = match (&f, &err) {
                 (_, Some(e)) => {
                     let _ = r.tx.send(Event::Error(e.clone()));
-                    "Error".to_string()
+                    ("Error".to_string(), "error")
                 }
                 (Some(f), None) => {
                     let _ = r.tx.send(Event::Done { finish: *f });
-                    format!("{f:?}")
+                    (format!("{f:?}"), f.as_str())
                 }
-                _ => "?".into(),
+                _ => ("?".to_string(), "error"),
             };
             let decode = total.saturating_sub(ttft);
             let tps = if r.generated > 1 { (r.generated - 1) as f64 / decode.as_secs_f64().max(1e-9) } else { 0.0 };
+            m.record(RequestRecord::new(
+                &r.job_id,
+                r.prompt_tokens,
+                engine.cached_prompt_tokens(id),
+                r.generated,
+                Timings { queued: r.started - r.queued, prefill: ttft, decode, total },
+                finish_s,
+            ));
             tracing::info!(id = %r.job_id, prompt_tokens = r.prompt_tokens, cached_prompt_tokens = engine.cached_prompt_tokens(id), generated = r.generated,
                 queue_ms = (r.started - r.queued).as_millis() as u64, prefill_ms = ttft.as_millis() as u64, decode_ms = decode.as_millis() as u64,
                 decode_tps = format!("{tps:.2}"), finish = fin, running = running.len(), "done");
@@ -322,6 +358,7 @@ fn run_batch(mut engine: Box<dyn BatchEngine>, rx: std_mpsc::Receiver<Job>, pend
         for id in gone {
             done(engine.as_mut(), &mut running, id, Some(Finish::Cancelled), None);
         }
+        m.batch_active(running.len());
         if running.is_empty() {
             continue;
         }

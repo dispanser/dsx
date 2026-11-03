@@ -438,3 +438,122 @@ async fn large_request_bodies_are_accepted() {
     let (status, text) = post(&base, "/v1/chat/completions", body).await;
     assert_ne!(status, 413, "{}", &text[..text.len().min(200)]);
 }
+
+// ---- monitor (GET /metrics, GET /monitor)
+
+/// GET a JSON route, optionally with headers; non-200 bodies are not parsed.
+async fn get_json(base: &str, path: &str, headers: &[(&str, &str)]) -> (u16, Value) {
+    let mut req = reqwest::Client::new().get(format!("{base}{path}"));
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let r = req.send().await.unwrap();
+    let status = r.status().as_u16();
+    let text = r.text().await.unwrap();
+    let v = if status == 200 { serde_json::from_str(&text).expect("metrics JSON") } else { Value::Null };
+    (status, v)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_report_every_request() {
+    let base = start_cfg(MockMode::Scripted, 1, ServerConfig::default()).await;
+    let r = post_json(&base, "/v1/chat/completions", json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]})).await;
+    assert_eq!(r["choices"][0]["finish_reason"], "stop");
+
+    let (status, m) = get_json(&base, "/metrics", &[]).await;
+    assert_eq!(status, 200);
+    assert_eq!(m["server"]["model"], "deepseek-v4.1-flash");
+    assert_eq!(m["server"]["ctx"], 32768);
+    assert_eq!(m["server"]["queued"], 0);
+    assert_eq!(m["live"]["state"], "idle");
+    assert_eq!(m["live"]["active"], 0);
+
+    assert_eq!(m["totals"]["requests"].as_u64().unwrap(), 1);
+    let rec = &m["requests"][0];
+    assert_eq!(m["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(rec["finish"], "stop");
+    assert_eq!(rec["api"], "openai");
+    assert!(rec["prompt_tokens"].as_u64().unwrap() > 0, "prompt tokens: {rec}");
+    assert_eq!(rec["cached_prompt_tokens"], 0);
+    assert!(rec["generated"].as_u64().unwrap() > 0, "generated tokens: {rec}");
+    assert!(rec["duration_s"].as_f64().unwrap() > 0.0, "duration: {rec}");
+    assert!(rec["prefill_tok_s"].as_f64().unwrap() > 0.0, "prefill rate: {rec}");
+    assert!(rec["decode_tok_s"].as_f64().unwrap() > 0.0, "decode rate: {rec}");
+
+    // totals agree with the record, and the peak is that request's decode rate
+    assert_eq!(m["totals"]["generated_tokens"], rec["generated"]);
+    assert_eq!(m["totals"]["prompt_tokens"], rec["prompt_tokens"]);
+    assert_eq!(m["totals"]["peak_decode_tok_s"], rec["decode_tok_s"]);
+    assert!(m["totals"]["peak_decode_time"].as_f64().unwrap() > 0.0);
+
+    // a second request: two records, newest first, and a second API shows up as such
+    post_json(&base, "/v1/messages", json!({"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]})).await;
+    let (_, m) = get_json(&base, "/metrics", &[]).await;
+    assert_eq!(m["totals"]["requests"].as_u64().unwrap(), 2);
+    assert_eq!(m["requests"][0]["api"], "anthropic");
+    assert!(m["requests"][0]["time"].as_f64().unwrap() >= m["requests"][1]["time"].as_f64().unwrap(), "records are not newest first: {m}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_show_the_running_request() {
+    // echo a ~300-token prompt at 20 ms/token, and read /metrics while it streams
+    let base = start(MockMode::Echo, 20).await;
+    let client = reqwest::Client::new();
+    let long: String = (0..250).map(|i| format!("t{i} ")).collect();
+    let mut r = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": long}]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.chunk().await.unwrap().is_some());
+
+    let t = Instant::now();
+    let m = loop {
+        let (_, m) = get_json(&base, "/metrics", &[]).await;
+        if m["live"]["generated"].as_u64().unwrap_or(0) >= 2 {
+            break m;
+        }
+        assert!(t.elapsed() < Duration::from_secs(2), "no tokens counted in /metrics");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(m["live"]["state"], "generating");
+    assert_eq!(m["live"]["active"], 1);
+    assert_eq!(m["server"]["queued"], 1);
+    assert!(m["live"]["prompt_tokens"].as_u64().unwrap() > 0);
+    assert!(m["live"]["elapsed_s"].as_f64().unwrap() > 0.0);
+    assert!(m["live"]["tok_s"].as_f64().unwrap() > 0.0);
+    assert_eq!(m["totals"]["requests"], 0, "nothing recorded while it runs");
+
+    drop(r); // closes the stream: the engine's next emit returns false
+    let t = Instant::now();
+    let m = loop {
+        let (_, m) = get_json(&base, "/metrics", &[]).await;
+        if m["totals"]["requests"].as_u64().unwrap_or(0) == 1 {
+            break m;
+        }
+        assert!(t.elapsed() < Duration::from_secs(2), "the cancelled request was not recorded");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(m["live"]["state"], "idle");
+    assert_eq!(m["requests"][0]["finish"], "cancelled");
+    assert!(m["requests"][0]["generated"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_sit_behind_the_key_but_the_page_is_open() {
+    // like the chat UI's shell: the page loads without a key (a browser cannot put a header on a document
+    // load) and sends the key itself with its /metrics fetch
+    let base = start_cfg(MockMode::Scripted, 0, keyed()).await;
+    let client = reqwest::Client::new();
+    let page = client.get(format!("{base}/monitor")).send().await.unwrap();
+    assert_eq!(page.status().as_u16(), 200);
+    assert!(page.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+    assert!(page.text().await.unwrap().contains("dsx monitor"));
+
+    assert_eq!(get_json(&base, "/metrics", &[]).await.0, 401);
+    let (status, m) = get_json(&base, "/metrics", &[("x-api-key", KEY)]).await;
+    assert_eq!(status, 200);
+    assert_eq!(m["live"]["state"], "idle");
+    assert_eq!(m["requests"].as_array().unwrap().len(), 0);
+}

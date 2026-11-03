@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod engine;
+pub mod metrics;
 pub mod mock;
 pub mod sample;
 pub mod webui;
@@ -146,6 +147,7 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/v1/models", get(models))
         .route("/props", get(webui::props))
         .route("/slots", get(webui::slots))
+        .route("/metrics", get(metrics))
         .route("/tools", get(webui::no_tools).post(webui::no_tools))
         .route("/v1/streams/lookup", post(webui::no_streams))
         .route_layer(middleware::from_fn_with_state(st.clone(), auth::require_key));
@@ -154,6 +156,7 @@ pub fn router(st: Arc<AppState>) -> Router {
     let open = Router::new()
         .route("/health", get(health))
         .route("/v1/health", get(health))
+        .route("/monitor", get(monitor_page))
         .fallback(get(webui::asset));
     // request bodies up to 32 MB (base64 images; axum's default is 2 MB)
     api.merge(open).layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)).with_state(st)
@@ -289,6 +292,39 @@ async fn models(State(st): State<Arc<AppState>>) -> Response {
 
 async fn health(State(st): State<Arc<AppState>>) -> Response {
     axum::Json(json!({"status": "ok", "model": st.cfg.model_name, "pending": st.engine.pending()})).into_response()
+}
+
+/// GET /metrics: the monitor page's data - what the engine is doing, the recent requests and the totals
+/// since the start. Behind the key when one is set, like every route that reports on the model.
+async fn metrics(State(st): State<Arc<AppState>>) -> Response {
+    let snap = st.engine.metrics.snapshot();
+    let c = &st.cfg;
+    axum::Json(json!({
+        "server": {
+            "model": c.model_name,
+            "ctx": c.ctx,
+            "vision": c.vision,
+            "version": concat!("dsx ", env!("CARGO_PKG_VERSION")),
+            "since": snap.since,
+            "uptime_s": snap.uptime_s,
+            "queued": st.engine.pending(),
+        },
+        "live": snap.live,
+        "totals": snap.totals,
+        "requests": snap.requests,
+    }))
+    .into_response()
+}
+
+/// GET /monitor: the monitor page, embedded from core/webui/monitor.html. Open like the chat UI's
+/// shell (a browser cannot put a header on a document load); the page sends the key itself with its
+/// /metrics fetch.
+async fn monitor_page() -> Response {
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"))],
+        include_str!("../../webui/monitor.html"),
+    )
+        .into_response()
 }
 
 // ---- the shared request path

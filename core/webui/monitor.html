@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsx monitor</title>
+<style>
+  :root {
+    --bg: #0e1013; --card: #171a20; --line: #242932; --fg: #e8eaed; --muted: #8a929e;
+    --accent: #4d6bfe; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --mono: ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 4px 0 18px; }
+  .sub { color: var(--muted); }
+  .pill { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .pill.live .dot { background: var(--ok); } .pill.down .dot { background: var(--bad); }
+  .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  .label { color: var(--muted); font-size: 12px; display: block; margin-bottom: 4px; }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .big { font-size: 34px; font-weight: 600; line-height: 1.1; }
+  .big small { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  #decode, #prefill, #now { grid-column: span 5; } #prefill { grid-column: span 3; } #now { grid-column: span 4; }
+  .minis { grid-column: span 12; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .mini .big { font-size: 22px; }
+  .badge { display: inline-block; padding: 1px 9px; border-radius: 99px; font-size: 12px; border: 1px solid var(--line); }
+  .badge.reading { color: var(--accent); border-color: var(--accent); }
+  .badge.generating { color: var(--ok); border-color: var(--ok); }
+  #requests { grid-column: span 12; }
+  .spark { display: block; width: 100%; height: 44px; margin-top: 10px; }
+  .spark .area { fill: color-mix(in oklab, var(--accent) 20%, transparent); }
+  .spark .line { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th { text-align: right; color: var(--muted); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td.badge-cell { text-align: left; }
+  .f-stop { color: var(--ok); } .f-length, .f-cancelled { color: var(--warn); } .f-error { color: var(--bad); }
+  .api { color: var(--muted); font-size: 12px; margin-left: 6px; }
+  #key-panel { display: none; grid-column: span 12; }
+  #key-panel input { background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; width: min(420px, 100%); }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 6px 14px; cursor: pointer; }
+  .empty { color: var(--muted); padding: 14px 8px; }
+  @media (max-width: 800px) {
+    #decode, #prefill, #now { grid-column: span 12; }
+    .minis { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>dsx monitor</h1>
+    <span class="sub" id="model"></span>
+    <span class="pill" id="conn"><span class="dot"></span><span id="conn-text">connecting…</span></span>
+  </header>
+
+  <div id="key-panel" class="card">
+    <span class="label">This server requires its API key. Paste it once; it stays in this browser.</span>
+    <input id="key-input" placeholder="API key" autocomplete="off">
+    <button id="key-save">Save</button>
+  </div>
+
+  <div class="grid">
+    <section id="decode" class="card">
+      <span class="label" id="decode-label">Decode</span>
+      <span class="big num"><span id="decode-val">–</span><small>tok/s</small></span>
+      <svg class="spark" id="decode-spark" viewBox="0 0 100 32" preserveAspectRatio="none"></svg>
+      <span class="note">Peak <b class="num" id="peak">–</b> tok/s since the start</span>
+    </section>
+    <section id="prefill" class="card">
+      <span class="label" id="prefill-label">Prefill</span>
+      <span class="big num"><span id="prefill-val">–</span><small>tok/s</small></span>
+      <span class="note">The last request's prompt, tokens read per second</span>
+    </section>
+    <section id="now" class="card">
+      <span class="label">Right now</span>
+      <span class="badge" id="state">idle</span>
+      <span class="num" id="now-detail" style="margin-left:10px"></span>
+      <span class="note num" id="now-nums"></span>
+    </section>
+    <div class="minis">
+      <section class="card mini"><span class="label">Requests served</span><span class="big num" id="t-requests">–</span></section>
+      <section class="card mini"><span class="label">Prompt tokens</span><span class="big num" id="t-prompt">–</span><span class="note num" id="t-reused"></span></section>
+      <section class="card mini"><span class="label">Generated tokens</span><span class="big num" id="t-generated">–</span></section>
+      <section class="card mini"><span class="label">Uptime</span><span class="big num" id="t-uptime">–</span><span class="note num" id="t-since"></span></section>
+    </div>
+    <section id="requests" class="card">
+      <span class="label">Recent requests</span>
+      <table>
+        <thead><tr><th>Time</th><th>Status</th><th>Prompt</th><th>Reused</th><th>Prefill</th><th>Output</th><th>Decode</th><th>Took</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="empty" id="no-requests">No requests yet</div>
+    </section>
+  </div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+// integers with thousands separators, `d` decimals; null prints as a dash
+const fmt = (n, d = 0) => n == null ? "–" : Number(n).toLocaleString("en-US", { maximumFractionDigits: d });
+const secs = (s) => s == null ? "" : s < 90 ? `${s.toFixed(s < 10 ? 1 : 0)} s` : `${Math.floor(s / 60)} min ${Math.round(s % 60)} s`;
+const FINISH = { stop: ["stop", "f-stop"], length: ["max tokens", "f-length"], cancelled: ["stopped", "f-cancelled"], error: ["error", "f-error"] };
+const API = { openai: "OpenAI", anthropic: "Anthropic", responses: "Responses", api: "API" };
+
+let key = localStorage.getItem("dsx-api-key") || "";
+let hist = [];        // the decode reading of each poll, newest last; the sparkline's samples
+let badPolls = 0;
+
+function headers() { return key ? { authorization: `Bearer ${key}` } : {}; }
+
+async function poll() {
+  try {
+    const r = await fetch("/metrics", { headers: headers() });
+    if (r.status === 401) { $("key-panel").style.display = "block"; setConn("needs its API key", ""); return; }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const m = await r.json();
+    $("key-panel").style.display = "none";
+    badPolls = 0;
+    setConn("live", "live");
+    render(m);
+  } catch (e) {
+    if (++badPolls > 1) setConn("unreachable", "down");
+  }
+}
+
+function setConn(text, cls) {
+  $("conn-text").textContent = text;
+  $("conn").className = `pill ${cls}`;
+}
+
+function render(m) {
+  const { server, live, totals, requests } = m;
+  const last = requests[0];
+
+  $("model").textContent = `${server.model} · ${server.version}`;
+  $("t-uptime").textContent = secs(server.uptime_s);
+  $("t-since").textContent = new Date(server.since * 1000).toLocaleString();
+
+  // the hero number: the live rate while writing, else the last answer's
+  const writing = live.state === "generating" && live.tok_s != null;
+  const decode = writing ? live.tok_s : last ? last.decode_tok_s : null;
+  $("decode-label").textContent = `Decode · ${writing ? "writing now" : last ? "last request" : "waiting"}`;
+  $("decode-val").textContent = fmt(decode, 1);
+  hist.push(decode); if (hist.length > 60) hist.shift();
+  drawSpark($("decode-spark"), hist);
+
+  $("prefill-label").textContent = `Prefill · ${live.state === "reading" ? "reading now" : last ? "last request" : "waiting"}`;
+  $("prefill-val").textContent = live.state === "reading" ? "…" : fmt(last ? last.prefill_tok_s : null);
+  $("peak").textContent = fmt(totals.peak_decode_tok_s, 1);
+
+  const badge = $("state");
+  badge.textContent = live.state === "idle" ? "idle" : live.state === "reading" ? "reading" : "writing";
+  badge.className = `badge ${live.state === "idle" ? "" : live.state}`;
+  let detail = "";
+  if (live.state === "reading") detail = `${fmt(live.prompt_tokens)} prompt tokens · ${secs(live.elapsed_s)}`;
+  if (live.state === "generating") detail = `${fmt(live.generated)} tokens · ${secs(live.elapsed_s)}`;
+  if (live.state === "idle" && last) detail = `last answer: ${fmt(last.generated)} tokens`;
+  $("now-detail").textContent = detail;
+  $("now-nums").textContent = [live.active > 1 ? `${live.active} answers at once` : "",
+    server.queued > 0 ? `${server.queued} queued` : ""].filter(Boolean).join(" · ");
+
+  $("t-requests").textContent = fmt(totals.requests);
+  $("t-prompt").textContent = fmt(totals.prompt_tokens);
+  $("t-reused").textContent = `${fmt(totals.cached_prompt_tokens)} reused from the cache`;
+  $("t-generated").textContent = fmt(totals.generated_tokens);
+
+  $("no-requests").style.display = requests.length ? "none" : "block";
+  $("rows").innerHTML = requests.map((r) => {
+    const [text, cls] = FINISH[r.finish] || [r.finish, ""];
+    const t = new Date(r.time * 1000).toLocaleTimeString();
+    return `<tr><td class="num">${t}</td><td class="badge-cell"><span class="${cls}">${text}</span>` +
+      `<span class="api">${API[r.api] || r.api}</span></td><td class="num">${fmt(r.prompt_tokens)}</td>` +
+      `<td class="num">${fmt(r.cached_prompt_tokens)}</td><td class="num">${fmt(r.prefill_tok_s)}</td>` +
+      `<td class="num">${fmt(r.generated)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>` +
+      `<td class="num">${secs(r.duration_s)}</td></tr>`;
+  }).join("");
+}
+
+function drawSpark(svg, values) {
+  const v = values.map((x) => (x == null ? 0 : +x));   // idle gaps read as zero, like maya's sparklines
+  if (v.length < 2 || v.every((x) => x === 0)) { svg.innerHTML = ""; return; }
+  const top = Math.max(...v, 1e-9);
+  const d = v.map((x, i) => `${i ? "L" : "M"}${((i / (v.length - 1)) * 100).toFixed(2)},${(30 - (x / top) * 26).toFixed(2)}`).join("");
+  svg.innerHTML = `<path class="area" d="${d}L100,32L0,32Z"/><path class="line" d="${d}"/>`;
+}
+
+$("key-save").onclick = () => { key = $("key-input").value.trim(); localStorage.setItem("dsx-api-key", key); poll(); };
+$("key-input").addEventListener("keydown", (e) => { if (e.key === "Enter") $("key-save").onclick(); });
+poll();
+// the page is a passive reader: no point polling a hidden tab
+setInterval(() => { if (!document.hidden) poll(); }, 1000);
+</script>
+</body>
+</html>
