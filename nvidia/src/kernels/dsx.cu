@@ -201,6 +201,58 @@ __device__ float e2m1_round(float v) {
   return copysignf(q, v);
 }
 
+// packed FP4 E2M1: 3 magnitude bits (0, .5, 1, 1.5, 2, 3, 4, 6) + sign. The scale byte is E4M3 or a
+// biased power-of-two exponent (E8M0), the two kinds fake_fp4 uses.
+__device__ int e2m1_code(float v) {
+  float a = fabsf(v);
+  int c = (a == 0.f) ? 0 : (a == 0.5f) ? 1 : (a == 1.f) ? 2 : (a == 1.5f) ? 3 : (a == 2.f) ? 4
+        : (a == 3.f) ? 5 : (a == 4.f) ? 6 : 7;
+  return c | (signbit(v) ? 8 : 0);
+}
+// the code's value times 2^-14: its bits (sign, magnitude) are an FP16's at 15 and 11..9
+__device__ float e2m1_val14(unsigned c) {
+  return __half2float(__ushort_as_half((unsigned short)(((c & 8u) << 12) | ((c & 7u) << 9))));
+}
+__device__ unsigned char e4m3_byte(float s) {
+  if (s < 0.015625f) return (unsigned char)lrintf(s * 512.f);
+  int e;
+  float m = frexpf(s, &e);
+  int exp = e + 6, mant = (int)lrintf((m * 2.f - 1.f) * 8.f);
+  if (mant == 8) { mant = 0; exp += 1; }
+  return (unsigned char)((exp << 3) | mant);
+}
+__device__ float e4m3_val(unsigned char b) {
+  int exp = (b >> 3) & 0xF, mant = b & 7;
+  float v = exp == 0 ? (float)mant * 0.001953125f : __uint_as_float(((exp + 120) << 23) | (mant << 20));
+  return (b & 0x80) ? -v : v;
+}
+__device__ unsigned char pow2_byte(float s) {
+  int e;
+  frexpf(s, &e);
+  return (unsigned char)(e - 1 + 127);
+}
+__device__ float pow2_val(unsigned char b) { return __uint_as_float((uint32_t)b << 23); }
+
+// 32 values part*32 .. +32 of a packed compressed row as BF16 into dst[0..4): 16 code bytes, then 2 E4M3
+// scale bytes per 32 values (block 16). The values are E2M1 times an E4M3 scale, exact in BF16.
+__device__ __forceinline__ void unpack32(const unsigned char *row, int part, int hd, uint4 *dst) {
+  uint4 cw = *(const uint4 *)(row + part * 16);
+  float f0 = e4m3_val(row[hd / 2 + part * 2]) * 16384.f, f1 = e4m3_val(row[hd / 2 + part * 2 + 1]) * 16384.f;
+  const uint32_t wv[4] = {cw.x, cw.y, cw.z, cw.w};
+  uint32_t o[16];
+#pragma unroll
+  for (int j = 0; j < 16; j++) {
+    uint32_t b = wv[j >> 2] >> (8 * (j & 3));
+    float ks = j < 8 ? f0 : f1;
+    float lo = e2m1_val14(b) * ks, hi = e2m1_val14(b >> 4) * ks;
+    o[j] = (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);
+  }
+  dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+  dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+  dst[2] = make_uint4(o[8], o[9], o[10], o[11]);
+  dst[3] = make_uint4(o[12], o[13], o[14], o[15]);
+}
+
 // one warp per block of 32: FP8 E4M3 with a power-of-two scale. n multiple of 32.
 extern "C" __global__ void fake_fp8(float *x, int n) {
   int b = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -255,6 +307,25 @@ extern "C" __global__ void fake_fp4(float *x, int n, int block, int e4m3s) {
   for (int o = block / 2; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));
   float s = e4m3s ? e4m3_round(fmaxf(a, 6.f * 0.001953125f) / 6.f) : pow2_ceil(fmaxf(a, 6.f * 1.1754944e-38f) / 6.f);
   x[b * 32 + lane] = e2m1_round(fminf(fmaxf(v / s, -6.f), 6.f)) * s;
+}
+
+// fake_fp4 with a packed store: the dequantized value stays in x, and dst gets n/2 code bytes followed
+// by n/block scale bytes. block = 16 (E4M3 scale) or 32 (power-of-two scale); one warp per 32 values.
+extern "C" __global__ void fake_fp4_pack(float *x, int n, int block, int e4m3s, unsigned char *dst) {
+  int b = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (b * 32 >= n) return;
+  int i = b * 32 + lane;
+  float v = x[i];
+  float a = fabsf(v);
+  for (int o = block / 2; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));
+  float s = e4m3s ? e4m3_round(fmaxf(a, 6.f * 0.001953125f) / 6.f) : pow2_ceil(fmaxf(a, 6.f * 1.1754944e-38f) / 6.f);
+  float q = e2m1_round(fminf(fmaxf(v / s, -6.f), 6.f));
+  int code = e2m1_code(q);
+  // the shuffle needs every lane in the mask, so it runs before the even-lane branch
+  int hi = __shfl_down_sync(0xffffffff, code, 1);
+  if ((lane & 1) == 0) dst[i >> 1] = (unsigned char)(code | (hi << 4));
+  if (lane % block == 0) dst[n / 2 + i / block] = e4m3s ? e4m3_byte(s) : pow2_byte(s);
+  x[i] = q * s;
 }
 
 // ---------------------------------------------------------------- hyper-connections
@@ -467,6 +538,86 @@ extern "C" __global__ void __launch_bounds__(256) sparse_attn_tile(const float *
   }
 }
 
+// sparse_attn_tile with the compressed rows packed: 16 bytes = 32 FP4 codes, then 2 E4M3 scale bytes per
+// 32 values (block 16). The window stays bf16. Same contract and output as sparse_attn_tile.
+extern "C" __global__ void __launch_bounds__(256) sparse_attn_tile_fp4(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
+                                                                      const unsigned char *comp, const int *comp_idx, int K, float *part,
+                                                                      int H, int hd, float scale) {
+  __shared__ __align__(16) __nv_bfloat16 R[AP_R][AP_LD];
+  __shared__ float P[AP_H][AP_R];
+  __shared__ float Mh[AP_H], Lh[AP_H];
+  __shared__ int ok[AP_R];
+  int t = blockIdx.x, h0 = blockIdx.y * AP_H, z = blockIdx.z, S = gridDim.z, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  int nrows = W + K;
+  // stage 32 rows: 16 chunks of 16 bytes (32 values) each
+  for (int c = tid; c < AP_R * 16; c += 256) {
+    int r = c >> 4, chunk = c & 15, i = z * AP_R + r;
+    int idx = i >= nrows ? -1 : (i < W ? win_idx[t * W + i] : comp_idx[t * K + (i - W)]);
+    uint4 v[4] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
+    if (idx >= 0) {
+      if (i < W) {
+        const __nv_bfloat16 *src = win + (size_t)idx * hd + chunk * 32;
+        v[0] = *(const uint4 *)src;
+        v[1] = *(const uint4 *)(src + 8);
+        v[2] = *(const uint4 *)(src + 16);
+        v[3] = *(const uint4 *)(src + 24);
+      } else {
+        unpack32(comp + (size_t)idx * (hd / 2 + hd / 16), chunk, hd, v);
+      }
+    }
+    for (int j = 0; j < 4; j++) *(uint4 *)&R[r][chunk * 32 + j * 8] = v[j];
+    if (chunk == 0) ok[r] = idx >= 0;
+  }
+  __syncthreads();
+  // scores: lane = row, warp = 2 heads
+  {
+    const float *qa = q + ((size_t)t * H + h0 + 2 * w) * hd, *qb = qa + hd;
+    float sa = 0.f, sb = 0.f;
+    for (int d = 0; d < 512; d += 8) {
+      uint4 rv = *(const uint4 *)&R[lane][d];
+      const __nv_bfloat162 *r2 = (const __nv_bfloat162 *)&rv;
+      float4 a0 = __ldg((const float4 *)(qa + d)), a1 = __ldg((const float4 *)(qa + d + 4));
+      float4 b0 = __ldg((const float4 *)(qb + d)), b1 = __ldg((const float4 *)(qb + d + 4));
+      float2 x0 = __bfloat1622float2(r2[0]), x1 = __bfloat1622float2(r2[1]), x2 = __bfloat1622float2(r2[2]), x3 = __bfloat1622float2(r2[3]);
+      sa += a0.x * x0.x + a0.y * x0.y + a0.z * x1.x + a0.w * x1.y + a1.x * x2.x + a1.y * x2.y + a1.z * x3.x + a1.w * x3.y;
+      sb += b0.x * x0.x + b0.y * x0.y + b0.z * x1.x + b0.w * x1.y + b1.x * x2.x + b1.y * x2.y + b1.z * x3.x + b1.w * x3.y;
+    }
+    bool v = ok[lane];
+    sa = v ? sa * scale : -1e30f;
+    sb = v ? sb * scale : -1e30f;
+    float ma = warp_max(sa), mb = warp_max(sb);
+    float pa = v ? expf(sa - ma) : 0.f, pb = v ? expf(sb - mb) : 0.f;
+    float la = warp_sum(pa), lb = warp_sum(pb);
+    P[2 * w][lane] = pa;
+    P[2 * w + 1][lane] = pb;
+    if (lane == 0) { Mh[2 * w] = ma; Lh[2 * w] = la; Mh[2 * w + 1] = mb; Lh[2 * w + 1] = lb; }
+  }
+  __syncthreads();
+  // PV: thread = dims 2*tid, 2*tid+1
+  float acc[AP_H][2];
+#pragma unroll
+  for (int h = 0; h < AP_H; h++) acc[h][0] = acc[h][1] = 0.f;
+  for (int r = 0; r < AP_R; r++) {
+    float2 x = __bfloat1622float2(*(const __nv_bfloat162 *)&R[r][2 * tid]);
+#pragma unroll
+    for (int h = 0; h < AP_H; h++) {
+      float p = P[h][r];
+      acc[h][0] += p * x.x;
+      acc[h][1] += p * x.y;
+    }
+  }
+#pragma unroll
+  for (int h = 0; h < AP_H; h++) {
+    float *ph = part + (((size_t)t * S + z) * H + h0 + h) * (hd + 2);
+    *(float2 *)(ph + 2 * tid) = make_float2(acc[h][0], acc[h][1]);
+  }
+  if (tid < AP_H) {
+    float *ph = part + (((size_t)t * S + z) * H + h0 + tid) * (hd + 2);
+    ph[hd] = Mh[tid];
+    ph[hd + 1] = Lh[tid];
+  }
+}
+
 // merge for sparse_attn_tile: grid (T, H), block 256 (thread = 2 dims)
 extern "C" __global__ void sparse_attn_merge(const float *part, int S, const float *sinks, float *o, int H, int hd) {
   int t = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
@@ -568,9 +719,9 @@ __device__ __forceinline__ uint32_t pack_bf16(float a, float b) {
 
 // SM80 only (ldmatrix / mma bf16 / cp.async above); the SM70 port lands in a later task.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-template <bool SPLIT>
+template <bool SPLIT, bool PACKED>
 __device__ __forceinline__ void sparse_attn_tc_body(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
-                                                    const __nv_bfloat16 *comp, const int *comp_idx, int K, const float *sinks,
+                                                    const void *comp, const int *comp_idx, int K, const float *sinks,
                                                     float *o, int H, float scale) {
   constexpr int NT = TC_NT, PS = NT + 4, PP = NT + 8, RPT = NT / 8, NQ = SPLIT ? 2 : 1;
   extern __shared__ uint4 smem[];
@@ -628,15 +779,33 @@ __device__ __forceinline__ void sparse_attn_tc_body(const float *q, const __nv_b
 
   auto load = [&](int tile) {
     __nv_bfloat16 *dst = rb + (tile & 1) * NT * 512;
-#pragma unroll
-    for (int k = tid; k < NT * 64; k += 256) {
-      int r = k >> 6, ch = k & 63, e = tile * NT + r, sz = 0;
-      const __nv_bfloat16 *src = win;
-      if (e < nv) {
-        int v = list[e];
-        src = ((v & 1) ? comp : win) + (size_t)(v >> 1) * 512 + ch * 8, sz = 16;
+    if constexpr (PACKED) {
+      // a thread: 32 values of a row; compressed rows are 16 code bytes + 2 scales, unpacked to BF16
+      for (int k = tid; k < NT * 16; k += 256) {
+        int r = k >> 4, ch = k & 15, e = tile * NT + r;
+        uint4 o[4] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
+        if (e < nv) {
+          int v = list[e];
+          if (v & 1) {
+            unpack32((const unsigned char *)comp + (size_t)(v >> 1) * (512 / 2 + 512 / 16), ch, 512, o);
+          } else {
+            const __nv_bfloat16 *src = win + (size_t)(v >> 1) * 512 + ch * 32;
+            for (int j = 0; j < 4; j++) o[j] = *(const uint4 *)(src + j * 8);
+          }
+        }
+        for (int j = 0; j < 4; j++) *(uint4 *)(dst + r * 512 + (((ch * 4 + j) ^ (r & 7)) << 3)) = o[j];
       }
-      cp_async16(dst + r * 512 + ((ch ^ (r & 7)) << 3), src, sz);
+    } else {
+#pragma unroll
+      for (int k = tid; k < NT * 64; k += 256) {
+        int r = k >> 6, ch = k & 63, e = tile * NT + r, sz = 0;
+        const __nv_bfloat16 *src = win;
+        if (e < nv) {
+          int v = list[e];
+          src = ((v & 1) ? (const __nv_bfloat16 *)comp : win) + (size_t)(v >> 1) * 512 + ch * 8, sz = 16;
+        }
+        cp_async16(dst + r * 512 + ((ch ^ (r & 7)) << 3), src, sz);
+      }
     }
     asm volatile("cp.async.commit_group;");
   };
@@ -768,12 +937,23 @@ __device__ __forceinline__ void sparse_attn_tc_body(const float *q, const __nv_b
 extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
                                                                   const __nv_bfloat16 *comp, const int *comp_idx, int K,
                                                                   const float *sinks, float *o, int H, int hd, float scale) {
-  sparse_attn_tc_body<true>(q, win, win_idx, W, comp, comp_idx, K, sinks, o, H, scale);
+  sparse_attn_tc_body<true, false>(q, win, win_idx, W, comp, comp_idx, K, sinks, o, H, scale);
 }
 extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc_fast(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
                                                                        const __nv_bfloat16 *comp, const int *comp_idx, int K,
                                                                        const float *sinks, float *o, int H, int hd, float scale) {
-  sparse_attn_tc_body<false>(q, win, win_idx, W, comp, comp_idx, K, sinks, o, H, scale);
+  sparse_attn_tc_body<false, false>(q, win, win_idx, W, comp, comp_idx, K, sinks, o, H, scale);
+}
+// the same two with the compressed rows packed (16 code bytes + 2 E4M3 scales per 32 values)
+extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc_fp4(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
+                                                                     const unsigned char *comp, const int *comp_idx, int K,
+                                                                     const float *sinks, float *o, int H, int hd, float scale) {
+  sparse_attn_tc_body<true, true>(q, win, win_idx, W, comp, comp_idx, K, sinks, o, H, scale);
+}
+extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc_fast_fp4(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
+                                                                          const unsigned char *comp, const int *comp_idx, int K,
+                                                                          const float *sinks, float *o, int H, int hd, float scale) {
+  sparse_attn_tc_body<false, true>(q, win, win_idx, W, comp, comp_idx, K, sinks, o, H, scale);
 }
 #else
 // SM70 stubs: same kernel names (loaded by name via cuModuleGetFunction) so the fatbin keeps its export surface.
@@ -789,6 +969,18 @@ extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc(const float *q,
 extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc_fast(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
                                                                        const __nv_bfloat16 *comp, const int *comp_idx, int K,
                                                                        const float *sinks, float *o, int H, int hd, float scale) {
+  (void)q; (void)win; (void)win_idx; (void)W; (void)comp; (void)comp_idx; (void)K; (void)sinks; (void)o; (void)H; (void)hd; (void)scale;
+  __trap();
+}
+extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc_fp4(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
+                                                                     const unsigned char *comp, const int *comp_idx, int K,
+                                                                     const float *sinks, float *o, int H, int hd, float scale) {
+  (void)q; (void)win; (void)win_idx; (void)W; (void)comp; (void)comp_idx; (void)K; (void)sinks; (void)o; (void)H; (void)hd; (void)scale;
+  __trap();
+}
+extern "C" __global__ void __launch_bounds__(256) sparse_attn_tc_fast_fp4(const float *q, const __nv_bfloat16 *win, const int *win_idx, int W,
+                                                                          const unsigned char *comp, const int *comp_idx, int K,
+                                                                          const float *sinks, float *o, int H, int hd, float scale) {
   (void)q; (void)win; (void)win_idx; (void)W; (void)comp; (void)comp_idx; (void)K; (void)sinks; (void)o; (void)H; (void)hd; (void)scale;
   __trap();
 }
@@ -816,6 +1008,30 @@ extern "C" __global__ void indexer_score(const float *q, const __nv_bfloat16 *k,
   const __nv_bfloat16 *kr = k + (size_t)s * ID + lane * 4;
   float kv[4];
   for (int j = 0; j < 4; j++) kv[j] = __bfloat162float(kr[j]);
+  float tot = 0.f;
+  for (int h = 0; h < IH; h++) {
+    const float *qh = q + ((size_t)t * IH + h) * ID + lane * 4;
+    float d = qh[0] * kv[0] + qh[1] * kv[1] + qh[2] * kv[2] + qh[3] * kv[3];
+    d = warp_sum(d);
+    tot += fmaxf(d, 0.f) * w[t * IH + h];
+  }
+  if (lane == 0) sc[s] = tot;
+}
+
+// the same with the keys packed: ID/2 code bytes, then ID/32 power-of-two scale bytes (block 32)
+extern "C" __global__ void indexer_score_fp4(const float *q, const unsigned char *k, const float *w, float *score,
+                                             const int *n_vis, int n, int IH, int ID) {
+  int t = blockIdx.y, s = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (s >= n) return;
+  float *sc = score + (size_t)t * n;
+  if (s >= n_vis[t]) {
+    if (lane == 0) sc[s] = -INFINITY;
+    return;
+  }
+  const unsigned char *kr = k + (size_t)s * (ID / 2 + ID / 32);
+  unsigned char b0 = kr[lane * 2], b1 = kr[lane * 2 + 1];
+  float ks = pow2_val(kr[ID / 2 + lane / 8]) * 16384.f;
+  float kv[4] = {e2m1_val14(b0) * ks, e2m1_val14(b0 >> 4) * ks, e2m1_val14(b1) * ks, e2m1_val14(b1 >> 4) * ks};
   float tot = 0.f;
   for (int h = 0; h < IH; h++) {
     const float *qh = q + ((size_t)t * IH + h) * ID + lane * 4;

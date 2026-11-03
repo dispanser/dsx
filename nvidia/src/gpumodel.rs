@@ -183,6 +183,8 @@ pub struct GpuModel<'m> {
     fuse2: bool,
     /// one token: attention merge + inverse RoPE + fake FP8 in one launch (DSX_FUSE3=0: separate)
     fuse3: bool,
+    /// the compressed KV rows are packed FP4 (DSX_KV_FP4=1; hd 512, fused attention, arch >= 80)
+    kv_fp4: bool,
     qb_rope: bool,
     /// one token: the sublayers' closing hc_post inside o_b's GEMV and combine_post (DSX_FUSE4=1; off by default)
     fuse4: bool,
@@ -291,8 +293,8 @@ pub struct Placement {
 }
 
 pub const KERNELS: &[&str] = &[
-    "gemv_q8_0", "gemv_f16", "gemv_f32", "rmsnorm", "round_bf16", "rope", "fake_fp8", "fake_fp4", "hc_mixes", "hc_pre",
-    "hc_post", "sparse_attn", "sparse_attn_tile", "sparse_attn_merge", "store_bf16", "indexer_score", "compress_pool", "router_topk", "swiglu", "add_inplace",
+    "gemv_q8_0", "gemv_f16", "gemv_f32", "rmsnorm", "round_bf16", "rope", "fake_fp8", "fake_fp4", "fake_fp4_pack", "hc_mixes", "hc_pre",
+    "hc_post", "sparse_attn", "sparse_attn_tile", "sparse_attn_tile_fp4", "sparse_attn_merge", "store_bf16", "indexer_score", "indexer_score_fp4", "compress_pool", "router_topk", "swiglu", "add_inplace",
     "engram_gate", "scale_bf16", "gemv_fp8b32", "gemv_fp8b32_o", "gemv_bf16", "fake_fp8_copy", "gemv_q2_0", "gemv_ptq1_0", "gemv_q3_k", "publish_route", "combine_experts", "spin_wait", "rope_pos", "compress_pairs", "gather_f16", "swiglu_rows_f16", "scatter_add", "engram_gate_t", "dequant_f16", "dequant_f16_iq8", "dequant_t16_f16", "t16_pre", "t16_post", "to_f16", "ring_scatter", "pack_f16", "gemv_q8r", "gemv_q8r4", "hc_dots", "hc_dots_t", "hc_finish", "hc_finish_w", "gemv_q8g", "hc_pre_mb", "hc_post_mb", "to_bf16", "gemv_q8r_sk", "gemv_f16_sk", "gemv_bf16_sk", "gemv_f32_sk", "hc_part", "hc_reduce", "gemv_q6p", "dequant_q6p_f16", "gemv_q5p", "dequant_q5p_f16", "gemv_q6g4", "gemv_q6g8", "gemv_q6s8", "gemv_q5p4",
     "fwht_rows_f16", "hc_reduce_finish", "kv_norm_rope_store", "add_noise_rows", "hc_add_post", "hc_pre_norm", "router_publish", "gemv_q8r1", "gemv_bf16_sk1", "gemv_f16_sk1", "gemv_q8r_sk1", "combine_post", "gemv_q8g_bf", "gemv_q8r_gu", "sparse_attn_merge_rf", "gemv_q8r1_rope", "gemv_q8r1_post", "vit_rmsnorm", "vit_bias_add", "vit_rope_split", "vit_softmax", "vit_heads_merge", "vit_swiglu", "vit_unfold3", "vit_gelu_bias", "vit_to_bf16",
 ];
@@ -391,6 +393,13 @@ impl<'m> GpuModel<'m> {
         };
         let f16mat = f32mat; // hc fn matrices: kept f32 (exact for both F16 GGUF and F32 checkpoint values)
         let bf16zeros = |n: usize| g.alloc_zeroed(n * 2);
+        // packed FP4 compressed rows: the fused attention kernels and hd 512 only; the prefill path needs the
+        // tensor-core mma kernels, which start at arch 80 (Volta falls back to the CUDA-core `sparse_attn`)
+        let kv_fp4 = std::env::var("DSX_KV_FP4").is_ok_and(|v| v == "1")
+            && c.head_dim == 512
+            && g.arch >= 80
+            && std::env::var("DSX_FUSE3").map_or(true, |v| v != "0")
+            && std::env::var_os("DSX_OLD_ATTN").is_none();
         let mut layers = vec![];
         for l in &m.layers {
             let ratio = l.ratio.max(1);
@@ -425,8 +434,24 @@ impl<'m> GpuModel<'m> {
                 engram_kv: up_engram(&l.engram_kv)?,
                 engram_qk: upv(&l.engram_qk)?,
                 window: bf16zeros(c.window * c.head_dim)?,
-                comp_cache: if is_src { Some(bf16zeros(max_ctx / ratio * c.head_dim)?) } else { None },
-                idx_cache: if is_src { Some(bf16zeros(max_ctx / ratio * c.idx_dim)?) } else { None },
+                comp_cache: if is_src {
+                    Some(if kv_fp4 {
+                        g.alloc_zeroed(max_ctx / ratio * (c.head_dim / 2 + c.head_dim / 16))?
+                    } else {
+                        bf16zeros(max_ctx / ratio * c.head_dim)?
+                    })
+                } else {
+                    None
+                },
+                idx_cache: if is_src {
+                    Some(if kv_fp4 {
+                        g.alloc_zeroed(max_ctx / ratio * (c.idx_dim / 2 + c.idx_dim / 32))?
+                    } else {
+                        bf16zeros(max_ctx / ratio * c.idx_dim)?
+                    })
+                } else {
+                    None
+                },
                 comp_state: if is_src && ratio > 1 {
                     Some((g.alloc_zeroed(ratio * c.head_dim * 4)?, g.alloc_zeroed(ratio * c.head_dim * 4)?))
                 } else {
@@ -491,6 +516,7 @@ impl<'m> GpuModel<'m> {
             combine_fused: std::env::var("DSX_COMBINE_FUSED").map_or(true, |v| v != "0"),
             fuse2: std::env::var("DSX_FUSE2").map_or(true, |v| v != "0"),
             fuse3: std::env::var("DSX_FUSE3").map_or(true, |v| v != "0"),
+            kv_fp4,
             qb_rope: std::env::var("DSX_QB_ROPE").is_ok_and(|v| v == "1"),
             // window 34: 36.05 -> 36.03 tok/s teacher-forced (no gain): opt-in
             fuse4: std::env::var("DSX_FUSE4").is_ok_and(|v| v == "1"),
@@ -551,7 +577,7 @@ impl<'m> GpuModel<'m> {
             eprintln!("engram: rows gathered by persistent threads (layer 1's first)");
         }
         // prefill buffers before the experts take the rest of VRAM
-        gm.pb = Some(PrefillBufs::new(&gm.g, m, pl.prefill_chunk, max_ctx)?);
+        gm.pb = Some(PrefillBufs::new(&gm.g, m, pl.prefill_chunk, max_ctx, kv_fp4)?);
         let gpu0_bytes = if pl.gpu0_gb < 0.0 {
             let (free, _) = gm.g.mem_info()?;
             free.saturating_sub((-pl.gpu0_gb * 1e9) as usize)
@@ -909,7 +935,8 @@ impl<'m> GpuModel<'m> {
         }
         let s = (w + k).div_ceil(32);
         anyhow::ensure!(s <= ATTN_SPLITS, "attention over {} rows: more than {ATTN_SPLITS} tiles", w + k);
-        self.g.launch(self.k["sparse_attn_tile"], (t as u32, (nh / 16) as u32, s as u32), 256, 0, &[Arg::P(q), Arg::P(win), Arg::P(win_idx), Arg::I(w as i32), Arg::P(comp), Arg::P(comp_idx), Arg::I(k as i32), Arg::P(self.attn_part.ptr), Arg::I(nh as i32), Arg::I(hd as i32), Arg::F(scale)])?;
+        let tile = if self.kv_fp4 { self.k["sparse_attn_tile_fp4"] } else { self.k["sparse_attn_tile"] };
+        self.g.launch(tile, (t as u32, (nh / 16) as u32, s as u32), 256, 0, &[Arg::P(q), Arg::P(win), Arg::P(win_idx), Arg::I(w as i32), Arg::P(comp), Arg::P(comp_idx), Arg::I(k as i32), Arg::P(self.attn_part.ptr), Arg::I(nh as i32), Arg::I(hd as i32), Arg::F(scale)])?;
         self.g.launch(self.k["sparse_attn_merge"], (t as u32, nh as u32, 1), 256, 0, &[Arg::P(self.attn_part.ptr), Arg::I(s as i32), Arg::P(sinks), Arg::P(o), Arg::I(nh as i32), Arg::I(hd as i32)])
     }
 
@@ -1286,6 +1313,17 @@ impl<'m> GpuModel<'m> {
         )
     }
 
+    /// fake_fp4 with the packed store: n/2 code bytes, then n/block scale bytes at `dst`
+    fn fake_fp4_pack(&self, x: u64, n: usize, block: usize, e4m3s: bool, dst: u64) -> Result<()> {
+        self.g.launch(
+            self.k["fake_fp4_pack"],
+            ((n as u32 / 32).div_ceil(8), 1, 1),
+            256,
+            0,
+            &[Arg::P(x), Arg::I(n as i32), Arg::I(block as i32), Arg::I(e4m3s as i32), Arg::P(dst)],
+        )
+    }
+
     fn store_bf16(&self, x: u64, dst: u64, n: usize) -> Result<()> {
         self.g.launch(self.k["store_bf16"], ((n as u32).div_ceil(256), 1, 1), 256, 0, &[Arg::P(x), Arg::P(dst), Arg::I(n as i32)])
     }
@@ -1433,9 +1471,14 @@ impl<'m> GpuModel<'m> {
             if have_latent {
                 let l = &self.layers[li];
                 self.rope(self.lat.ptr, 1, hd, true, t + 1 - ratio, false)?;
-                self.fake_fp4(self.lat.ptr, hd, 16, true)?;
                 let n = l.n_comp;
-                self.store_bf16(self.lat.ptr, l.comp_cache.as_ref().unwrap().ptr + (n * hd * 2) as u64, hd)?;
+                if self.kv_fp4 {
+                    let stride = hd / 2 + hd / 16;
+                    self.fake_fp4_pack(self.lat.ptr, hd, 16, true, l.comp_cache.as_ref().unwrap().ptr + (n * stride) as u64)?;
+                } else {
+                    self.fake_fp4(self.lat.ptr, hd, 16, true)?;
+                    self.store_bf16(self.lat.ptr, l.comp_cache.as_ref().unwrap().ptr + (n * hd * 2) as u64, hd)?;
+                }
                 self.layers[li].n_comp += 1;
             }
             n_comp_rows = self.topk_k;
@@ -1454,7 +1497,8 @@ impl<'m> GpuModel<'m> {
             let s = (w + n_comp_rows).div_ceil(32);
             anyhow::ensure!(s <= ATTN_SPLITS, "attention over {} rows: more than {ATTN_SPLITS} tiles", w + n_comp_rows);
             let scale = 1.0 / (hd as f32).sqrt();
-            self.g.launch(self.k["sparse_attn_tile"], (1, (nh / 16) as u32, s as u32), 256, 0, &[Arg::P(self.q.ptr), Arg::P(l.window.ptr), Arg::P(self.tokp.ptr), Arg::I(w as i32), Arg::P(comp_ptr), Arg::P(self.comp_idx.ptr), Arg::I(n_comp_rows as i32), Arg::P(self.attn_part.ptr), Arg::I(nh as i32), Arg::I(hd as i32), Arg::F(scale)])?;
+            let tile = if self.kv_fp4 { self.k["sparse_attn_tile_fp4"] } else { self.k["sparse_attn_tile"] };
+            self.g.launch(tile, (1, (nh / 16) as u32, s as u32), 256, 0, &[Arg::P(self.q.ptr), Arg::P(l.window.ptr), Arg::P(self.tokp.ptr), Arg::I(w as i32), Arg::P(comp_ptr), Arg::P(self.comp_idx.ptr), Arg::I(n_comp_rows as i32), Arg::P(self.attn_part.ptr), Arg::I(nh as i32), Arg::I(hd as i32), Arg::F(scale)])?;
             self.ev(li, 14)?;
             let f = if compressed { &self.freqs.1 } else { &self.freqs.0 };
             self.g.launch(self.k["sparse_attn_merge_rf"], (1, nh as u32, 1), (hd / 2) as u32, 0, &[Arg::P(self.attn_part.ptr), Arg::I(s as i32), Arg::P(l.sinks.ptr), Arg::P(self.o.ptr), Arg::I(nh as i32), Arg::I(hd as i32), Arg::P(f.ptr), Arg::I(c.rope_dim as i32), Arg::I(t as i32)])?;
@@ -1516,9 +1560,14 @@ impl<'m> GpuModel<'m> {
                 self.gemv(l.idx_k.as_ref().unwrap(), self.lat.ptr, self.tmp.ptr)?;
                 self.rmsnorm(self.tmp.ptr, l.idx_k_norm.as_ref().unwrap(), self.tmp.ptr, id, false)?;
                 self.rope(self.tmp.ptr, 1, id, true, t + 1 - ratio, false)?;
-                self.fake_fp4(self.tmp.ptr, id, 32, false)?;
                 let n = l.n_idx;
-                self.store_bf16(self.tmp.ptr, l.idx_cache.as_ref().unwrap().ptr + (n * id * 2) as u64, id)?;
+                if self.kv_fp4 {
+                    let stride = id / 2 + id / 32;
+                    self.fake_fp4_pack(self.tmp.ptr, id, 32, false, l.idx_cache.as_ref().unwrap().ptr + (n * stride) as u64)?;
+                } else {
+                    self.fake_fp4(self.tmp.ptr, id, 32, false)?;
+                    self.store_bf16(self.tmp.ptr, l.idx_cache.as_ref().unwrap().ptr + (n * id * 2) as u64, id)?;
+                }
                 self.layers[li].n_idx += 1;
             }
             self.idxk_src = li;
@@ -1533,8 +1582,9 @@ impl<'m> GpuModel<'m> {
         let end = (t + 1) / ratio;
         let nvis = self.tokp.ptr + 4 * (c.window + if ratio == 1 { 0 } else { 1 }) as u64;
         let kc = self.layers[self.idxk_src].idx_cache.as_ref().unwrap().ptr;
+        let isc = if self.kv_fp4 { self.k["indexer_score_fp4"] } else { self.k["indexer_score"] };
         self.g.launch(
-            self.k["indexer_score"],
+            isc,
             ((end as u32).div_ceil(8), 1, 1),
             256,
             0,

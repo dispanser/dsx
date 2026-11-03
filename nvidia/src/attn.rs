@@ -18,10 +18,15 @@ pub fn smem_bytes(rows: usize) -> usize {
 pub struct SparseAttnTc {
     k: Kernel,
     kf: Kernel,
+    /// packed-FP4 variants of k / kf, selected when the compressed rows are packed (DSX_KV_FP4)
+    k_fp4: Kernel,
+    kf_fp4: Kernel,
     /// arch < 80: the CUDA-core `sparse_attn` replaces the tensor-core kernels (same 12 arguments)
     serial: Option<Kernel>,
     /// use sparse_attn_tc_fast: q and p as single bf16 (2x fewer mma, ~bf16-level error on peaky softmax)
     pub fast: bool,
+    /// the compressed rows are packed FP4 (16 code bytes + 2 E4M3 scales per 32 values)
+    pub fp4: bool,
 }
 
 impl SparseAttnTc {
@@ -31,23 +36,34 @@ impl SparseAttnTc {
             g.kernel("sparse_attn_tc")?,
             g.kernel("sparse_attn_tc_fast")?,
         );
+        let (k_fp4, kf_fp4) = (
+            g.kernel("sparse_attn_tc_fp4")?,
+            g.kernel("sparse_attn_tc_fast_fp4")?,
+        );
         // Volta: the mma kernels do not exist (dsx.cu traps on them), and its 96 KB dynamic-smem ceiling is below
         // MAX_SMEM, so no limit raise. launch() sends every call to `sparse_attn`.
         if g.arch < 80 {
             return Ok(SparseAttnTc {
                 k,
                 kf,
+                k_fp4,
+                kf_fp4,
                 serial: Some(g.kernel("sparse_attn")?),
                 fast: false,
+                fp4: false,
             });
         }
-        g.set_smem(k, MAX_SMEM)?;
-        g.set_smem(kf, MAX_SMEM)?;
+        for x in [k, kf, k_fp4, kf_fp4] {
+            g.set_smem(x, MAX_SMEM)?;
+        }
         Ok(SparseAttnTc {
             k,
             kf,
+            k_fp4,
+            kf_fp4,
             serial: None,
             fast: false,
+            fp4: false,
         })
     }
 
@@ -89,7 +105,12 @@ impl SparseAttnTc {
             Arg::F(1.0 / (hd as f32).sqrt()),
         ];
         if let Some(serial) = self.serial {
-            // SM70: one warp per head over the gathered rows (nh % 32 == 0 implies nh % 8 == 0)
+            // SM70: one warp per head over the gathered rows (nh % 32 == 0 implies nh % 8 == 0). The serial kernel
+            // reads bf16 rows, so a packed cache has no kernel to run on — the flag gates on arch >= 80.
+            ensure!(
+                !self.fp4,
+                "sparse_attn_tc: packed FP4 KV needs the tensor-core kernels (arch >= 80)"
+            );
             return g.launch(serial, (t as u32, (nh / 8) as u32, 1), 256, 0, &args);
         }
         let smem = smem_bytes(w + k);
@@ -98,8 +119,14 @@ impl SparseAttnTc {
             "sparse_attn_tc: {} rows per token do not fit in smem",
             w + k
         );
+        let kern = match (self.fast, self.fp4) {
+            (false, false) => self.k,
+            (true, false) => self.kf,
+            (false, true) => self.k_fp4,
+            (true, true) => self.kf_fp4,
+        };
         g.launch(
-            if self.fast { self.kf } else { self.k },
+            kern,
             (t as u32, (nh / 32) as u32, 1),
             256,
             smem as u32,

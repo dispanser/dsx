@@ -323,7 +323,7 @@ impl PrefillBufs {
     fn tmp_ptr(&self) -> u64 { self.tmp.as_ref().map_or(self.q.ptr, |b| b.ptr) }
     fn tmp_bytes(&self) -> usize { self.tmp.as_ref().map_or(self.q.bytes, |b| b.bytes) }
 
-    pub fn new(g: &Gpu, m: &Model, tmax: usize, max_ctx: usize) -> Result<PrefillBufs> {
+    pub fn new(g: &Gpu, m: &Model, tmax: usize, max_ctx: usize, kv_fp4: bool) -> Result<PrefillBufs> {
         let c = &m.cfg;
         let tmax = tmax.max(1);
         let f = |n: usize| g.alloc(n * 4);
@@ -380,7 +380,11 @@ impl PrefillBufs {
             stage_off: std::cell::Cell::new(0),
             out: f(tmax * c.dim)?,
             logits: f(crate::handoff::MAXT * c.vocab)?, // [rows][vocab]: a verify pass's logits
-            attn_tc: crate::attn::SparseAttnTc::new(g)?,
+            attn_tc: {
+                let mut a = crate::attn::SparseAttnTc::new(g)?;
+                a.fp4 = kv_fp4;
+                a
+            },
         })
     }
 }
@@ -881,9 +885,16 @@ impl GpuModel<'_> {
                 let l = &self.layers[li];
                 self.up(pb, pb.ns.ptr, &lat_pos)?;
                 self.rope_rows(pb.lat.ptr, 1, hd, true, pb.ns.ptr, new_lat, false)?;
-                self.fake_fp4(pb.lat.ptr, new_lat * hd, 16, true)?;
                 let nc = l.n_comp;
-                self.store_bf16(pb.lat.ptr, l.comp_cache.as_ref().unwrap().ptr + (nc * hd * 2) as u64, new_lat * hd)?;
+                if self.kv_fp4 {
+                    let stride = hd / 2 + hd / 16;
+                    for i in 0..new_lat {
+                        self.fake_fp4_pack(pb.lat.ptr + (i * hd * 4) as u64, hd, 16, true, l.comp_cache.as_ref().unwrap().ptr + ((nc + i) * stride) as u64)?;
+                    }
+                } else {
+                    self.fake_fp4(pb.lat.ptr, new_lat * hd, 16, true)?;
+                    self.store_bf16(pb.lat.ptr, l.comp_cache.as_ref().unwrap().ptr + (nc * hd * 2) as u64, new_lat * hd)?;
+                }
                 self.layers[li].n_comp += new_lat;
             }
             kcomp = c.idx_topk;
@@ -969,9 +980,16 @@ impl GpuModel<'_> {
                 self.rms_rows(pb.ckv.ptr, l.idx_k_norm.as_ref().unwrap(), pb.ckv.ptr, id, new_lat, false)?;
                 self.up(pb, pb.ns.ptr, lat_pos)?;
                 self.rope_rows(pb.ckv.ptr, 1, id, true, pb.ns.ptr, new_lat, false)?;
-                self.fake_fp4(pb.ckv.ptr, new_lat * id, 32, false)?;
                 let ni = l.n_idx;
-                self.store_bf16(pb.ckv.ptr, l.idx_cache.as_ref().unwrap().ptr + (ni * id * 2) as u64, new_lat * id)?;
+                if self.kv_fp4 {
+                    let stride = id / 2 + id / 32;
+                    for i in 0..new_lat {
+                        self.fake_fp4_pack(pb.ckv.ptr + (i * id * 4) as u64, id, 32, false, l.idx_cache.as_ref().unwrap().ptr + ((ni + i) * stride) as u64)?;
+                    }
+                } else {
+                    self.fake_fp4(pb.ckv.ptr, new_lat * id, 32, false)?;
+                    self.store_bf16(pb.ckv.ptr, l.idx_cache.as_ref().unwrap().ptr + (ni * id * 2) as u64, new_lat * id)?;
+                }
                 self.layers[li].n_idx += new_lat;
             }
             self.idxk_src = li;
@@ -1001,8 +1019,9 @@ impl GpuModel<'_> {
                 continue;
             }
             self.up(pb, pb.ns.ptr, &ns)?;
+            let isc = if self.kv_fp4 { self.k["indexer_score_fp4"] } else { self.k["indexer_score"] };
             self.g.launch(
-                self.k["indexer_score"],
+                isc,
                 ((n_max as u32).div_ceil(8), rows as u32, 1),
                 256,
                 0,
