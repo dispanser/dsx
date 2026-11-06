@@ -767,10 +767,10 @@ pub struct Arena {
     pub bytes: usize,
 }
 
-const DIO_ALIGN: usize = 4096;
+pub(crate) const DIO_ALIGN: usize = 4096;
 
 /// A page-aligned heap buffer (O_DIRECT needs aligned destinations).
-struct AlignedBuf {
+pub(crate) struct AlignedBuf {
     ptr: *mut u8,
     len: usize,
 }
@@ -778,7 +778,7 @@ struct AlignedBuf {
 unsafe impl Send for AlignedBuf {}
 
 impl AlignedBuf {
-    fn new(len: usize) -> AlignedBuf {
+    pub(crate) fn new(len: usize) -> AlignedBuf {
         let len = len.div_ceil(DIO_ALIGN) * DIO_ALIGN;
         let ptr = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(len, DIO_ALIGN).unwrap()) };
         assert!(!ptr.is_null(), "alloc of {len} bytes failed");
@@ -794,12 +794,12 @@ impl Drop for AlignedBuf {
 
 /// Reads byte ranges of a mapped GGUF with O_DIRECT, bypassing the page cache: the range (a slice of one of the
 /// file's mmaps) is widened to 4 KiB boundaries, read into a bounce buffer and copied out.
-struct DirectReader {
+pub(crate) struct DirectReader {
     files: Vec<(usize, usize, std::fs::File)>, // (map start, map len, file opened with O_DIRECT)
 }
 
 impl DirectReader {
-    fn open(g: &crate::gguf::Gguf) -> Result<DirectReader> {
+    pub(crate) fn open(g: &crate::gguf::Gguf) -> Result<DirectReader> {
         use std::os::unix::fs::OpenOptionsExt;
         const O_DIRECT: i32 = 0o40000; // x86_64 Linux
         let mut files = vec![];
@@ -810,7 +810,7 @@ impl DirectReader {
         Ok(DirectReader { files })
     }
 
-    fn read(&self, src: &[u8], dst: &mut [u8], bounce: &mut AlignedBuf) -> std::io::Result<()> {
+    pub(crate) fn read(&self, src: &[u8], dst: &mut [u8], bounce: &mut AlignedBuf) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt;
         let p = src.as_ptr() as usize;
         let Some((start, len, f)) = self.files.iter().find(|(s, n, _)| p >= *s && p + src.len() <= s + n) else {

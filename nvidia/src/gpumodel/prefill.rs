@@ -11,6 +11,21 @@
 use super::*;
 use crate::gguf::GType;
 
+unsafe extern "C" {
+    fn mincore(addr: *mut std::ffi::c_void, len: usize, vec: *mut u8) -> i32;
+}
+
+/// every page of `s` is in the page cache? The range is widened to page boundaries, so an edge page can belong
+/// to a neighbour; the interior dominates, and a wrong "resident" only costs one expert the mmap path.
+fn pages_resident(s: &[u8]) -> bool {
+    const PAGE: usize = 4096;
+    let p = s.as_ptr() as usize;
+    let (a0, a1) = (p & !(PAGE - 1), (p + s.len()).div_ceil(PAGE) * PAGE);
+    let mut v = vec![0u8; (a1 - a0) / PAGE];
+    let r = unsafe { mincore(a0 as *mut std::ffi::c_void, a1 - a0, v.as_mut_ptr()) };
+    r == 0 && v.iter().all(|&x| x & 1 != 0)
+}
+
 /// prefill weight expansion to f16: the 8-wide kernel for the IQ codebook types (GGUF blocks or repacked), else
 /// dequant_f16; same arguments
 fn dq_iq8(ty: i32, cols: usize) -> bool {
@@ -409,9 +424,32 @@ impl GpuModel<'_> {
     #[allow(clippy::too_many_arguments)]
     fn stage_expert(&self, g: &Gpu, li: usize, e: usize, base: u64, free: crate::gpu::Event, ready: crate::gpu::Event) -> Result<(u64, u64, u64, i32, i32)> {
         let ex = &self.m.layers[li].experts[e];
-        let (gb, ub, db) = match self.arena.and_then(|a| a.get(li, e)) {
-            Some([g, u, dn]) => (g, u, dn),
-            None => (ex.gate.bytes(), ex.up.bytes(), ex.down.bytes()),
+        let in_arena = self.arena.and_then(|a| a.get(li, e));
+        let mut dio_host = None;
+        if in_arena.is_none()
+            && std::env::var("DSX_PREFILL_DIO").map_or(true, |v| v != "0")
+            && let Some(dr) = &self.dio
+        {
+            let (gate, up, down) = (ex.gate.bytes(), ex.up.bytes(), ex.down.bytes());
+            if !pages_resident(gate) || !pages_resident(up) || !pages_resident(down) {
+                let (ga, ua) = (gate.len(), up.len());
+                let mut host = vec![0u8; ga + ua + down.len()];
+                let mut bounce = crate::experts::AlignedBuf::new(ga.max(ua).max(down.len()) + 2 * crate::experts::DIO_ALIGN);
+                dr.read(gate, &mut host[..ga], &mut bounce)?;
+                dr.read(up, &mut host[ga..ga + ua], &mut bounce)?;
+                dr.read(down, &mut host[ga + ua..], &mut bounce)?;
+                dio_host = Some(host);
+            }
+        }
+        let (gb, ub, db): (&[u8], &[u8], &[u8]) = match dio_host.as_deref() {
+            Some(h) => {
+                let (ga, ua) = (ex.gate.bytes().len(), ex.up.bytes().len());
+                (&h[..ga], &h[ga..ga + ua], &h[ga + ua..])
+            }
+            None => match in_arena {
+                Some([g, u, dn]) => (g, u, dn),
+                None => (ex.gate.bytes(), ex.up.bytes(), ex.down.bytes()),
+            },
         };
         g.wait(free, true)?;
         g.htod_side(base, gb)?;

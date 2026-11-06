@@ -166,6 +166,8 @@ pub struct GpuModel<'m> {
     xch: Option<&'static crate::handoff::Xch>,
     worker: Option<crate::handoff::CpuWorker>,
     arena: Option<&'static crate::experts::Arena>,
+    /// O_DIRECT reads of the GGUF for prefill's file experts whose pages are not in the page cache
+    dio: Option<crate::experts::DirectReader>,
     /// adaptive residency (the main GPU's store and fast-linked aux stores): replacements started per token per store
     /// (DSX_ADAPT, default 8; 0 = static placement)
     adapt: usize,
@@ -482,6 +484,7 @@ impl<'m> GpuModel<'m> {
             xch: None,
             worker: None,
             arena: None,
+            dio: None,
             adapt: std::env::var("DSX_ADAPT").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
             adapt_swaps: 0,
             adapt_s: 0.0,
@@ -698,6 +701,11 @@ impl<'m> GpuModel<'m> {
                 None
             };
             gm.arena = arena;
+            // O_DIRECT reads for prefill's cold file experts (the mmap copy crawls at demand-fault speed)
+            gm.dio = match &m.src {
+                crate::model::Source::Gguf(gg) => crate::experts::DirectReader::open(gg).ok(),
+                _ => None,
+            };
             gm.worker = Some(crate::handoff::CpuWorker::spawn(ms, xch, on_cpu, c.top_k, arena));
             // adaptive residency starts from the calibration prior: each expert's expected decayed score (its share of
             // the calibration tokens per layer x 1 / (1 - decay)), so placed experts keep their slots until the live
